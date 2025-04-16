@@ -60,6 +60,11 @@ The goal is to demonstrate a complex, layered approach combining PQC key exchang
     ```bash
     openssl req -x509 -newkey rsa:4096 -keyout server.key -out server.crt -sha256 -days 365 -nodes -subj "/CN=victim1.lab.local"
     ```
+    
+    ```bash
+    "C:\Program Files\OpenSSL-Win64\bin\openssl.exe" req -x509 -newkey rsa:4096 -keyout server.key -out server.crt -sha256 -days 365 -nodes -subj "/CN=victim1.lab.local"
+    ```
+
     This creates `server.key` and `server.crt`. Ensure `CERT_FILE` and `KEY_FILE` variables in the receiver script match these filenames.
 4.  **Configure IPs/Ports:**
     * Set `TARGET_IP` in the sender script.
