@@ -1,2 +1,2 @@
-oqs
+pqcrypto
 pycryptodome
